@@ -1,7 +1,5 @@
 'use strict';
-const logger = require('../utils/logger');
 
-/* ── Custom Error Class ───────────────────────────────────── */
 class AppError extends Error {
   constructor(message, statusCode) {
     super(message);
@@ -12,52 +10,52 @@ class AppError extends Error {
   }
 }
 
-/* ── Async handler (eliminates try/catch in routes) ─────── */
 const asyncHandler = fn => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
-/* ── 404 handler ─────────────────────────────────────────── */
 const notFound = (req, res, next) => {
-  next(new AppError(`Route ${req.originalUrl} not found`, 404));
+  next(new AppError(`Route ${req.originalUrl} not found.`, 404));
 };
 
-/* ── Global error handler ────────────────────────────────── */
 const globalErrorHandler = (err, req, res, next) => {
   err.statusCode = err.statusCode || 500;
-  err.status     = err.status || 'error';
+  err.status     = err.status     || 'error';
 
-  // Mongoose CastError (invalid ObjectId)
-  if (err.name === 'CastError') {
-    err = new AppError('Invalid resource ID', 400);
+  if (process.env.NODE_ENV === 'development') {
+    return res.status(err.statusCode).json({
+      status:  err.status,
+      message: err.message,
+      stack:   err.stack,
+    });
   }
+
+  // Production — don't leak stack traces
+  if (err.isOperational) {
+    return res.status(err.statusCode).json({
+      status:  err.status,
+      message: err.message,
+    });
+  }
+
   // Mongoose duplicate key
   if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    err = new AppError(`${field} already exists`, 409);
+    const field = Object.keys(err.keyValue || {})[0] || 'field';
+    return res.status(400).json({ status:'fail', message:`${field} already exists.` });
   }
+
   // Mongoose validation
   if (err.name === 'ValidationError') {
-    const messages = Object.values(err.errors).map(e => e.message).join('. ');
-    err = new AppError(messages, 400);
+    const msg = Object.values(err.errors).map(e => e.message).join('. ');
+    return res.status(400).json({ status:'fail', message: msg });
   }
+
   // JWT errors
-  if (err.name === 'JsonWebTokenError') {
-    err = new AppError('Invalid token. Please log in again.', 401);
-  }
-  if (err.name === 'TokenExpiredError') {
-    err = new AppError('Your session has expired. Please log in again.', 401);
-  }
+  if (err.name === 'JsonWebTokenError')  return res.status(401).json({ status:'fail', message:'Invalid token.' });
+  if (err.name === 'TokenExpiredError')  return res.status(401).json({ status:'fail', message:'Token expired.' });
 
-  // Log server errors
-  if (err.statusCode >= 500) {
-    logger.error(`[${req.method}] ${req.path} — ${err.message}`, { stack: err.stack });
-  }
-
-  res.status(err.statusCode).json({
-    status:  err.status,
-    message: err.message,
-    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
-  });
+  // Unknown — generic
+  console.error('UNHANDLED ERROR:', err);
+  res.status(500).json({ status:'error', message:'Something went wrong.' });
 };
 
 module.exports = { AppError, asyncHandler, notFound, globalErrorHandler };

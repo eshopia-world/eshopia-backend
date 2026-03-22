@@ -2,175 +2,91 @@
 const express = require('express');
 const Product = require('../models/Product');
 const Order   = require('../models/Order');
-const { AppError, asyncHandler } = require('../middleware/errorHandler');
-const { protect, restrictTo }    = require('../middleware/auth');
+const { asyncHandler, protect, restrictTo } = require('../middleware/auth');
+const router  = express.Router();
 
-const router = express.Router();
-
-/* ────────────────────────────────────────────────────────────
-   GET /api/products  — Public: list products with filters
-   ──────────────────────────────────────────────────────────── */
+/* GET /api/products */
 router.get('/', asyncHandler(async (req, res) => {
-  const {
-    cat, search, badge, minPrice, maxPrice,
-    sort = '-sold', page = 1, limit = 20,
-    vendorId, featured,
-  } = req.query;
-
+  const { cat, search, sort='-sold', limit=20, page=1, badge, minPrice, maxPrice } = req.query;
   const filter = { isActive: true };
-  if (cat && cat !== 'Tout')  filter.cat = new RegExp(cat, 'i');
-  if (badge)                  filter.badge = badge;
-  if (vendorId)               filter.vendorId = vendorId;
-  if (featured === 'true')    filter.featured = true;
+  if (cat && cat !== 'Tout') filter.cat = cat;
+  if (badge) filter.badge = badge;
+  if (search) filter.$text = { $search: search };
   if (minPrice || maxPrice) {
     filter.price = {};
-    if (minPrice) filter.price.$gte = parseFloat(minPrice);
-    if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
+    if (minPrice) filter.price.$gte = +minPrice;
+    if (maxPrice) filter.price.$lte = +maxPrice;
   }
-  if (search) {
-    filter.$or = [
-      { name:     new RegExp(search, 'i') },
-      { name_ar:  new RegExp(search, 'i') },
-      { name_en:  new RegExp(search, 'i') },
-      { cat:      new RegExp(search, 'i') },
-      { desc:     new RegExp(search, 'i') },
-      { tags:     new RegExp(search, 'i') },
-    ];
-  }
-
-  const [products, total] = await Promise.all([
-    Product.find(filter)
-      .sort(sort)
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit))
-      .select('-desc -desc_ar -desc_en'), // omit long fields from list
-    Product.countDocuments(filter),
-  ]);
-
-  res.json({
-    status: 'success',
-    total,
-    pages: Math.ceil(total / parseInt(limit)),
-    page:  parseInt(page),
-    products,
-  });
+  const products = await Product.find(filter).sort(sort).limit(+limit).skip((+page-1)*+limit).select('-cost').lean();
+  const total    = await Product.countDocuments(filter);
+  res.json({ status:'success', total, products });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/products/flash  — Flash deals (on sale items)
-   ──────────────────────────────────────────────────────────── */
+/* GET /api/products/flash */
 router.get('/flash', asyncHandler(async (req, res) => {
+  const now = new Date();
   const products = await Product.find({
-    isActive:  true,
-    old:       { $exists: true, $gt: 0 },
-    stock:     { $gt: 0 },
-  })
-    .sort('-sold')
-    .limit(12);
-
-  const endTs = getOrSetFlashEnd();
-
-  res.json({ status: 'success', products, flashEndTs: endTs });
+    isActive: true,
+    'flashDeal.isActive': true,
+    'flashDeal.endTime': { $gt: now },
+  }).sort('-sold').limit(12).lean();
+  // If no flash products in DB, return badge:'flash' products
+  const result = products.length ? products :
+    await Product.find({ isActive:true, badge:'flash' }).sort('-sold').limit(6).lean();
+  // End of day timestamp
+  const endOfDay = new Date(); endOfDay.setHours(23,59,59,0);
+  const flashEndTs = products[0]?.flashDeal?.endTime?.getTime() || endOfDay.getTime();
+  res.json({ status:'success', products:result, flashEndTs });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/products/recommendations/:id  — Cross-sell / upsell
-   ──────────────────────────────────────────────────────────── */
+/* GET /api/products/recommendations/:id */
 router.get('/recommendations/:id', asyncHandler(async (req, res) => {
   const product = await Product.findById(req.params.id);
-  if (!product) return res.json({ status: 'success', products: [] });
-
-  // 1. Same category (upsell)
-  const sameCat = await Product.find({
-    _id:      { $ne: product._id },
-    cat:      product.cat,
-    isActive: true,
-    stock:    { $gt: 0 },
-  }).sort('-sold').limit(4);
-
-  // 2. Frequently bought together (from order history)
-  const coOrdered = await Order.aggregate([
-    { $match: { 'items.productId': product._id, status: { $in: ['delivered', 'confirmed'] } } },
-    { $unwind: '$items' },
-    { $match: { 'items.productId': { $ne: product._id } } },
-    { $group: { _id: '$items.productId', count: { $sum: 1 } } },
-    { $sort: { count: -1 } },
-    { $limit: 4 },
-  ]);
-
-  const coIds = coOrdered.map(c => c._id);
-  const coProducts = await Product.find({
-    _id: { $in: coIds },
-    isActive: true,
-    stock: { $gt: 0 },
-  });
-
-  res.json({
-    status: 'success',
-    sameCat,
-    frequently_bought: coProducts,
-  });
-}));
-
-/* ────────────────────────────────────────────────────────────
-   GET /api/products/:id  — Single product detail
-   ──────────────────────────────────────────────────────────── */
-router.get('/:id', asyncHandler(async (req, res, next) => {
-  const product = await Product.findById(req.params.id);
-  if (!product || !product.isActive) {
-    return next(new AppError('Product not found.', 404));
+  if (!product) return res.status(404).json({ status:'fail', message:'Product not found.' });
+  // Co-purchase analysis
+  const orders = await Order.find({ 'items.productId': product._id, status:'delivered' }).select('items').lean();
+  const coIds = {};
+  for (const order of orders) {
+    for (const item of order.items) {
+      if (String(item.productId) !== String(product._id)) {
+        coIds[item.productId] = (coIds[item.productId] || 0) + 1;
+      }
+    }
   }
-  // Increment view count (fire and forget)
-  Product.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }).exec();
-
-  res.json({ status: 'success', product });
+  const topIds = Object.entries(coIds).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([id])=>id);
+  let related = await Product.find({ _id:{ $in:topIds }, isActive:true }).lean();
+  // Fallback to same category
+  if (related.length < 4) {
+    const extra = await Product.find({ cat:product.cat, _id:{ $ne:product._id, $nin:topIds }, isActive:true }).sort('-sold').limit(4-related.length).lean();
+    related = [...related, ...extra];
+  }
+  res.json({ status:'success', recommendations:related });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   POST /api/products  — Admin: create product
-   ──────────────────────────────────────────────────────────── */
-router.post('/', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res, next) => {
+/* GET /api/products/:id */
+router.get('/:id', asyncHandler(async (req, res) => {
+  const product = await Product.findByIdAndUpdate(req.params.id, { $inc:{ views:1 } }, { new:true }).select('-cost');
+  if (!product) return res.status(404).json({ status:'fail', message:'Product not found.' });
+  res.json({ status:'success', product });
+}));
+
+/* POST /api/products */
+router.post('/', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
   const product = await Product.create(req.body);
-  res.status(201).json({ status: 'success', product });
+  res.status(201).json({ status:'success', product });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   PUT /api/products/:id  — Admin/Vendor: update product
-   ──────────────────────────────────────────────────────────── */
-router.put('/:id', protect, restrictTo('admin', 'superadmin', 'vendor'), asyncHandler(async (req, res, next) => {
-  const filter = { _id: req.params.id };
-  // Vendors can only edit their own products
-  if (req.user.role === 'vendor') filter.vendorId = req.user._id;
-
-  const product = await Product.findOneAndUpdate(filter, req.body, {
-    new: true, runValidators: true,
-  });
-  if (!product) return next(new AppError('Product not found or unauthorized.', 404));
-  res.json({ status: 'success', product });
+/* PUT /api/products/:id */
+router.put('/:id', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const product = await Product.findByIdAndUpdate(req.params.id, req.body, { new:true, runValidators:true });
+  if (!product) return res.status(404).json({ status:'fail', message:'Product not found.' });
+  res.json({ status:'success', product });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   DELETE /api/products/:id  — Admin: soft delete
-   ──────────────────────────────────────────────────────────── */
-router.delete('/:id', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res, next) => {
-  const product = await Product.findByIdAndUpdate(
-    req.params.id, { isActive: false }, { new: true }
-  );
-  if (!product) return next(new AppError('Product not found.', 404));
-  res.json({ status: 'success', message: 'Product deactivated.' });
+/* DELETE /api/products/:id */
+router.delete('/:id', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  await Product.findByIdAndUpdate(req.params.id, { isActive:false });
+  res.json({ status:'success', message:'Product deactivated.' });
 }));
-
-/* ── Helpers ─────────────────────────────────────────────── */
-let _flashEnd = null;
-function getOrSetFlashEnd() {
-  const now = Date.now();
-  if (!_flashEnd || _flashEnd < now) {
-    // Set flash deal to end at midnight + 20 hours from now
-    _flashEnd = new Date();
-    _flashEnd.setHours(23, 59, 59, 0);
-    _flashEnd = _flashEnd.getTime();
-  }
-  return _flashEnd;
-}
 
 module.exports = router;

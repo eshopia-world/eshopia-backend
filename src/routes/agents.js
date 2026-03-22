@@ -2,82 +2,49 @@
 const express = require('express');
 const User    = require('../models/User');
 const Order   = require('../models/Order');
-const { AppError, asyncHandler } = require('../middleware/errorHandler');
-const { protect, restrictTo }    = require('../middleware/auth');
+const { asyncHandler, protect, restrictTo } = require('../middleware/auth');
+const router  = express.Router();
 
-const router = express.Router();
-
-/* ────────────────────────────────────────────────────────────
-   GET /api/agents  — Admin: list all agents
-   ──────────────────────────────────────────────────────────── */
-router.get('/', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res) => {
-  const agents = await User.find({ role: 'agent', isActive: true })
-    .select('name email phone city agentStats createdAt lastLoginAt');
-  res.json({ status: 'success', agents });
+/* GET /api/agents */
+router.get('/', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const agents = await User.find({ role:'agent', isActive:true }).lean();
+  const result = await Promise.all(agents.map(async a => {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const todayCalls = await Order.countDocuments({ assignedAgent:a._id, updatedAt:{ $gte:today } });
+    const totalConf  = await Order.countDocuments({ assignedAgent:a._id, status:'confirmed' });
+    const totalRef   = await Order.countDocuments({ assignedAgent:a._id, status:'refused' });
+    const total      = totalConf + totalRef;
+    return { ...a, stats:{ todayCalls, confirmed:totalConf, refused:totalRef, total, rate: total>0?Math.round(totalConf/total*100):0 } };
+  }));
+  res.json({ status:'success', agents:result });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   POST /api/agents  — Admin: create agent account
-   ──────────────────────────────────────────────────────────── */
-router.post('/', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res, next) => {
-  const { name, email, password, phone, city } = req.body;
-  if (!name || !email || !password) {
-    return next(new AppError('Name, email and password are required.', 400));
-  }
-
-  const agent = await User.create({ name, email, password, phone, city, role: 'agent' });
-  res.status(201).json({ status: 'success', agent });
+/* POST /api/agents */
+router.post('/', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const { name, email, phone, password } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ status:'fail', message:'All fields required.' });
+  const existing = await User.findOne({ email: email.toLowerCase() });
+  if (existing) return res.status(409).json({ status:'fail', message:'Email already exists.' });
+  const agent = await User.create({ name, email, password, phone, role:'agent' });
+  res.status(201).json({ status:'success', agent });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/agents/my-stats  — Agent: own performance stats
-   ──────────────────────────────────────────────────────────── */
-router.get('/my-stats', protect, restrictTo('agent', 'admin', 'superadmin'), asyncHandler(async (req, res) => {
-  const agentId = req.user._id;
-
-  const [myOrders, stats] = await Promise.all([
-    Order.find({ assignedAgent: agentId })
-      .sort('-updatedAt')
-      .limit(50)
-      .select('orderNumber client.name client.phone client.city status total createdAt'),
-    Order.aggregate([
-      { $match: { assignedAgent: agentId } },
-      { $group: {
-        _id: '$status',
-        count: { $sum: 1 },
-      }},
-    ]),
+/* GET /api/agents/my-stats */
+router.get('/my-stats', protect, restrictTo('agent'), asyncHandler(async (req, res) => {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const [todayCalls, totalConf, totalRef] = await Promise.all([
+    Order.countDocuments({ assignedAgent:req.user._id, updatedAt:{ $gte:today } }),
+    Order.countDocuments({ assignedAgent:req.user._id, status:'confirmed' }),
+    Order.countDocuments({ assignedAgent:req.user._id, status:'refused' }),
   ]);
-
-  const statsMap = Object.fromEntries(stats.map(s => [s._id, s.count]));
-  const total    = Object.values(statsMap).reduce((a, b) => a + b, 0);
-  const confirmed = statsMap.confirmed || 0;
-
-  res.json({
-    status: 'success',
-    orders: myOrders,
-    performance: {
-      total,
-      confirmed,
-      refused:     statsMap.refused    || 0,
-      noAnswer:    statsMap.no_answer  || 0,
-      rescheduled: statsMap.rescheduled || 0,
-      successRate: total > 0 ? Math.round((confirmed / total) * 100) : 0,
-    },
-  });
+  const total = totalConf + totalRef;
+  res.json({ status:'success', stats:{ todayCalls, confirmed:totalConf, refused:totalRef, total, rate:total>0?Math.round(totalConf/total*100):0 } });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   PUT /api/agents/:id/deactivate  — Admin: disable agent
-   ──────────────────────────────────────────────────────────── */
-router.put('/:id/deactivate', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res, next) => {
-  const agent = await User.findOneAndUpdate(
-    { _id: req.params.id, role: 'agent' },
-    { isActive: false },
-    { new: true }
-  );
-  if (!agent) return next(new AppError('Agent not found.', 404));
-  res.json({ status: 'success', message: 'Agent deactivated.' });
+/* PUT /api/agents/:id/deactivate */
+router.put('/:id/deactivate', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  await User.findByIdAndUpdate(req.params.id, { isActive:false });
+  res.json({ status:'success', message:'Agent deactivated.' });
 }));
 
 module.exports = router;

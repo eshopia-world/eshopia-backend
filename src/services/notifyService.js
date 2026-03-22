@@ -2,127 +2,83 @@
 const axios  = require('axios');
 const logger = require('../utils/logger');
 
-/* ============================================================
-   E-SHOPIA — Notification Service
-   WhatsApp Business API + SMS (InTouch Morocco)
-   ============================================================ */
+/* ══════════════════════════════════════════════
+   NOTIFY SERVICE — WhatsApp Business + SMS
+   ══════════════════════════════════════════════ */
 
 const WA_TOKEN    = process.env.WHATSAPP_TOKEN;
 const WA_PHONE_ID = process.env.WHATSAPP_PHONE_ID;
+const WA_API      = `https://graph.facebook.com/v18.0/${WA_PHONE_ID}/messages`;
 const ADMIN_WA    = process.env.ADMIN_WHATSAPP;
 
-/* ── Core: Send WhatsApp message ─────────────────────────── */
+/* ── Send WhatsApp text message ── */
 async function sendWhatsApp(to, message) {
   if (!WA_TOKEN || !WA_PHONE_ID) {
-    logger.info(`[Notify] WA not configured. Would send to ${to}: ${message.substring(0, 60)}...`);
+    logger.debug(`[Notify] WA not configured — would send to ${to}: ${message.slice(0,60)}...`);
     return;
   }
-  // Normalize Moroccan number
-  const phone = to.replace(/^0/, '212').replace(/\D/g, '');
+  const phone = to.replace(/[^0-9]/g, '');
   try {
-    await axios.post(
-      `https://graph.facebook.com/v18.0/${WA_PHONE_ID}/messages`,
-      {
-        messaging_product: 'whatsapp',
-        to: phone,
-        type: 'text',
-        text: { body: message },
-      },
-      { headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
+    await axios.post(WA_API, {
+      messaging_product: 'whatsapp',
+      to: phone,
+      type: 'text',
+      text: { body: message },
+    }, {
+      headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
+    });
     logger.info(`[Notify] WA sent to ${phone}`);
   } catch (err) {
-    logger.error(`[Notify] WA failed to ${phone}: ${err.response?.data?.error?.message || err.message}`);
+    logger.warn(`[Notify] WA failed to ${phone}: ${err.response?.data?.error?.message || err.message}`);
   }
 }
 
-/* ── Core: Send SMS via InTouch Morocco ──────────────────── */
-async function sendSMS(to, message) {
-  if (!process.env.INTOUCH_API_KEY) {
-    logger.info(`[Notify] SMS not configured. Would send to ${to}`);
-    return;
-  }
-  const phone = to.replace(/^0/, '+212');
-  try {
-    await axios.post('https://api.intouchsms.ma/api/sms/send', {
-      apiKey:  process.env.INTOUCH_API_KEY,
-      sender:  process.env.INTOUCH_SENDER || 'ESHOPIA',
-      to:      phone,
-      message: message.substring(0, 160),
-    });
-    logger.info(`[Notify] SMS sent to ${phone}`);
-  } catch (err) {
-    logger.error(`[Notify] SMS failed to ${phone}: ${err.message}`);
-  }
+/* ── Notify admin of new order ── */
+async function newOrderAdmin(order) {
+  if (!ADMIN_WA) return;
+  const items = order.items.map(i => `• ${i.productName} x${i.qty}`).join('\n');
+  const msg = `🛒 *Nouvelle commande E-Shopia*\n\n` +
+    `📋 *${order.orderNumber}*\n` +
+    `👤 ${order.client?.name}\n` +
+    `📞 ${order.client?.phone}\n` +
+    `📍 ${order.client?.city}\n` +
+    `💰 *${order.total} DH* (COD)\n\n` +
+    `${items}\n\n` +
+    `⚡ Confirmez rapidement !`;
+  await sendWhatsApp(ADMIN_WA, msg);
 }
 
-/* ── Notification templates ──────────────────────────────── */
-const notifyService = {
+/* ── Notify client of order status change ── */
+async function orderStatusUpdated(order) {
+  const phone = order.client?.phone;
+  if (!phone) return;
 
-  /* Order placed — notify client + admin */
-  async orderPlaced(order) {
-    const { client, orderNumber, total } = order;
+  const msgs = {
+    confirmed: `✅ *Commande confirmée !*\n\nBonjour ${order.client?.name},\n\nVotre commande *${order.orderNumber}* a été confirmée.\n\n🚚 Livraison sous 24-48h à ${order.client?.city}.\n💵 Paiement en cash à la livraison.\n\nMerci de votre confiance — E-Shopia Maroc 🇲🇦`,
+    shipped:   `📦 *Commande expédiée !*\n\nBonjour ${order.client?.name},\n\nVotre commande *${order.orderNumber}* est en route !\n\n🚚 Livraison prévue aujourd'hui ou demain.\n${order.trackingCode ? `📍 Code suivi: ${order.trackingCode}` : ''}\n\nE-Shopia Maroc`,
+    delivered: `🎉 *Commande livrée !*\n\nBonjour ${order.client?.name},\n\nVotre commande *${order.orderNumber}* a été livrée.\n\n⭐ Vous êtes satisfait ? Laissez-nous un avis !\n💬 Contact: wa.me/212702010303\n\nMerci — E-Shopia Maroc 🛍️`,
+    refused:   `❌ *Commande annulée*\n\nBonjour ${order.client?.name},\n\nVotre commande *${order.orderNumber}* a été annulée.\n\nPour toute question: wa.me/212702010303\n\nE-Shopia Maroc`,
+  };
 
-    // Client notification
-    const clientMsg =
-      `✅ *Commande confirmée — E-Shopia Maroc*\n\n` +
-      `Bonjour ${client.name} !\n` +
-      `Votre commande *${orderNumber}* a bien été reçue.\n\n` +
-      `💰 Total: *${total} DH* (paiement à la livraison)\n` +
-      `🚚 Livraison: 24-48h\n\n` +
-      `Notre équipe vous appellera pour confirmer. Merci de votre confiance ! 🙏`;
+  const msg = msgs[order.status];
+  if (msg) await sendWhatsApp(phone, msg);
+}
 
-    await sendWhatsApp(client.phone, clientMsg);
+/* ── Abandoned cart recovery ── */
+async function abandonedCartReminder(phone, name, items) {
+  const msg = `🛒 *Vous avez oublié quelque chose !*\n\nBonjour ${name},\n\nVous avez laissé des articles dans votre panier :\n${items}\n\n🎁 Commandez maintenant et profitez de la livraison rapide !\n\n👉 eshopia.netlify.app\n\nE-Shopia Maroc 🇲🇦`;
+  await sendWhatsApp(phone, msg);
+}
 
-    // Admin notification
-    if (ADMIN_WA) {
-      const items = order.items.map(i => `  • ${i.productName} x${i.qty}`).join('\n');
-      const adminMsg =
-        `🛒 *Nouvelle commande — E-Shopia*\n\n` +
-        `📦 *${orderNumber}*\n` +
-        `👤 ${client.name} | 📞 ${client.phone}\n` +
-        `📍 ${client.city} — ${client.address}\n\n` +
-        `${items}\n\n` +
-        `💰 Total: *${total} DH* (COD)\n` +
-        `⚠️ Score fraude: ${order.fraudScore || 0}`;
-      await sendWhatsApp(ADMIN_WA, adminMsg);
-    }
-  },
+/* ── Low stock alert to admin ── */
+async function lowStockAlert(products) {
+  if (!ADMIN_WA || !products.length) return;
+  const list = products.map(p => `• ${p.name}: *${p.stock} restants*`).join('\n');
+  const msg = `⚠️ *Alerte Stock Faible — E-Shopia*\n\n${list}\n\nMettez à jour votre stock rapidement !`;
+  await sendWhatsApp(ADMIN_WA, msg);
+}
 
-  /* Order status updated */
-  async orderStatusUpdated(order) {
-    const { client, orderNumber, status } = order;
+/* ── orderPlaced = alias for newOrderAdmin ── */
+const orderPlaced = newOrderAdmin;
 
-    const messages = {
-      confirmed: `✅ *Commande confirmée !*\n\nBonjour ${client.name}, votre commande *${orderNumber}* a été confirmée.\n🚚 Livraison en cours de préparation. À bientôt !`,
-      shipped:   `📦 *Commande expédiée !*\n\nBonjour ${client.name}, votre commande *${orderNumber}* est en route !\n🕐 Livraison attendue dans 24-48h.\n${order.trackingCode ? `Code suivi: ${order.trackingCode}` : ''}`,
-      delivered: `🎉 *Commande livrée !*\n\nBonjour ${client.name}, votre commande *${orderNumber}* a été livrée.\nMerci pour votre achat ! ⭐ Laissez-nous un avis sur eshopia.ma`,
-      refused:   `❌ *Commande refusée*\n\nBonjour ${client.name}, votre commande *${orderNumber}* a été annulée.\nPour toute question: wa.me/212702010303`,
-      cancelled: `🚫 *Commande annulée*\n\nBonjour ${client.name}, votre commande *${orderNumber}* a été annulée à votre demande.`,
-    };
-
-    const msg = messages[status];
-    if (msg) await sendWhatsApp(client.phone, msg);
-  },
-
-  /* Affiliate payout approved */
-  async payoutApproved(affiliate, amount) {
-    const msg =
-      `💸 *Virement approuvé — E-Shopia Affilié*\n\n` +
-      `Bonjour ${affiliate.userName} !\n` +
-      `Votre demande de retrait de *${amount} DH* a été approuvée.\n` +
-      `⏱ Traitement sous 24-48h. Merci !`;
-    // Would send to affiliate's phone — store phone in Affiliate model
-    logger.info(`[Notify] Payout approved notification for ${affiliate.userName}: ${amount} DH`);
-  },
-
-  /* Low stock alert to admin */
-  async lowStockAlert(product) {
-    if (!ADMIN_WA) return;
-    const msg = `⚠️ *Stock faible — E-Shopia*\n\n📦 ${product.name}\nStock restant: *${product.stock} unités*\nID: ${product._id}`;
-    await sendWhatsApp(ADMIN_WA, msg);
-  },
-
-};
-
-module.exports = notifyService;
+module.exports = { sendWhatsApp, newOrderAdmin, orderPlaced, orderStatusUpdated, abandonedCartReminder, lowStockAlert };

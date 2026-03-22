@@ -4,176 +4,86 @@ const Order     = require('../models/Order');
 const Product   = require('../models/Product');
 const User      = require('../models/User');
 const Affiliate = require('../models/Affiliate');
-const { asyncHandler }      = require('../middleware/errorHandler');
-const { protect, restrictTo } = require('../middleware/auth');
+const { asyncHandler, protect, restrictTo } = require('../middleware/auth');
+const router    = express.Router();
 
-const router = express.Router();
+/* GET /api/analytics/overview */
+router.get('/overview', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const today     = new Date(); today.setHours(0,0,0,0);
+  const monthStart= new Date(today.getFullYear(), today.getMonth(), 1);
+  const last14    = new Date(Date.now() - 14*86400000);
 
-// All analytics require admin access
-router.use(protect, restrictTo('admin', 'superadmin'));
-
-/* ────────────────────────────────────────────────────────────
-   GET /api/analytics/overview  — Main KPI dashboard
-   ──────────────────────────────────────────────────────────── */
-router.get('/overview', asyncHandler(async (req, res) => {
-  const now     = new Date();
-  const today   = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const week    = new Date(Date.now() - 7  * 86400000);
-  const month   = new Date(Date.now() - 30 * 86400000);
-
-  const [
-    todayOrders, weekOrders, monthOrders,
-    statusBreakdown, topProducts, topCities,
-    affiliateStats, revenueByDay,
-  ] = await Promise.all([
-
-    // Today's orders
+  const [todayOrders, monthOrders, allDelivered, allRefused, allTotal,
+         topProducts, topCities, revenueByDay, affStats] = await Promise.all([
+    // Today
     Order.aggregate([
-      { $match: { createdAt: { $gte: today } } },
-      { $group: {
-        _id:      null,
-        count:    { $sum: 1 },
-        revenue:  { $sum: '$total' },
-        delivered: { $sum: { $cond: [{ $eq: ['$status','delivered'] }, 1, 0] } },
-        refused:  { $sum: { $cond: [{ $eq: ['$status','refused'] }, 1, 0] } },
-      }},
+      { $match:{ createdAt:{ $gte:today } } },
+      { $group:{ _id:null, orders:{ $sum:1 }, revenue:{ $sum:'$total' } } }
     ]),
-
-    // This week
+    // Month
     Order.aggregate([
-      { $match: { createdAt: { $gte: week } } },
-      { $group: { _id: null, count: { $sum: 1 }, revenue: { $sum: '$total' } }},
+      { $match:{ createdAt:{ $gte:monthStart } } },
+      { $group:{ _id:null, orders:{ $sum:1 }, revenue:{ $sum:'$total' } } }
     ]),
-
-    // This month
+    Order.countDocuments({ status:'delivered' }),
+    Order.countDocuments({ status:'refused' }),
+    Order.countDocuments(),
+    // Top products
     Order.aggregate([
-      { $match: { createdAt: { $gte: month } } },
-      { $group: { _id: null, count: { $sum: 1 }, revenue: { $sum: '$total' } }},
+      { $match:{ status:'delivered' } },
+      { $unwind:'$items' },
+      { $group:{ _id:'$items.productId', name:{ $first:'$items.productName' }, unitsSold:{ $sum:'$items.qty' }, revenue:{ $sum:{ $multiply:['$items.qty','$items.price'] } } } },
+      { $sort:{ unitsSold:-1 } }, { $limit:10 }
     ]),
-
-    // Status breakdown (all time)
-    Order.aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } }},
-    ]),
-
-    // Top 10 products by revenue
-    Order.aggregate([
-      { $match: { status: { $in: ['delivered','confirmed','shipped'] } }},
-      { $unwind: '$items' },
-      { $group: {
-        _id:      '$items.productId',
-        name:     { $first: '$items.productName' },
-        revenue:  { $sum: { $multiply: ['$items.price','$items.qty'] } },
-        unitsSold: { $sum: '$items.qty' },
-      }},
-      { $sort: { revenue: -1 } },
-      { $limit: 10 },
-    ]),
-
     // Top cities
     Order.aggregate([
-      { $group: { _id: '$client.city', count: { $sum: 1 }, revenue: { $sum: '$total' } }},
-      { $sort: { count: -1 } },
-      { $limit: 8 },
+      { $match:{ status:'delivered' } },
+      { $group:{ _id:'$client.city', count:{ $sum:1 }, revenue:{ $sum:'$total' } } },
+      { $sort:{ count:-1 } }, { $limit:8 }
     ]),
-
-    // Affiliate overview
-    Affiliate.aggregate([
-      { $group: {
-        _id:       null,
-        total:     { $sum: 1 },
-        clicks:    { $sum: '$totalClicks' },
-        orders:    { $sum: '$totalOrders' },
-        commissions: { $sum: '$totalEarned' },
-      }},
-    ]),
-
-    // Revenue by day (last 14 days)
+    // Revenue by day (last 14)
     Order.aggregate([
-      { $match: { createdAt: { $gte: new Date(Date.now() - 14 * 86400000) } } },
-      { $group: {
-        _id:     { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-        revenue: { $sum: '$total' },
-        orders:  { $sum: 1 },
-      }},
-      { $sort: { _id: 1 } },
+      { $match:{ createdAt:{ $gte:last14 }, status:{ $in:['delivered','confirmed','shipped'] } } },
+      { $group:{ _id:{ $dateToString:{ format:'%Y-%m-%d', date:'$createdAt' } }, orders:{ $sum:1 }, revenue:{ $sum:'$total' } } },
+      { $sort:{ _id:1 } }
+    ]),
+    // Affiliate summary
+    Affiliate.aggregate([
+      { $group:{ _id:null, total:{ $sum:1 }, clicks:{ $sum:'$totalClicks' }, orders:{ $sum:'$totalOrders' }, commissions:{ $sum:'$totalEarned' } } }
     ]),
   ]);
 
-  const t  = todayOrders[0] || { count: 0, revenue: 0, delivered: 0, refused: 0 };
-  const w  = weekOrders[0]  || { count: 0, revenue: 0 };
-  const m  = monthOrders[0] || { count: 0, revenue: 0 };
-  const sm = Object.fromEntries(statusBreakdown.map(s => [s._id, s.count]));
-  const totalOrders = Object.values(sm).reduce((a, b) => a + b, 0);
+  const deliveryRate = allTotal > 0 ? Math.round(allDelivered/allTotal*100) : 0;
+  const refusalRate  = allTotal > 0 ? Math.round(allRefused/allTotal*100)   : 0;
 
   res.json({
     status: 'success',
     overview: {
-      today:   { orders: t.count, revenue: t.revenue, delivered: t.delivered, refused: t.refused },
-      week:    { orders: w.count, revenue: w.revenue },
-      month:   { orders: m.count, revenue: m.revenue },
-      allTime: {
-        totalOrders,
-        pending:   sm.pending   || 0,
-        confirmed: sm.confirmed || 0,
-        shipped:   sm.shipped   || 0,
-        delivered: sm.delivered || 0,
-        refused:   sm.refused   || 0,
-        cancelled: sm.cancelled || 0,
-        deliveryRate:  totalOrders > 0 ? Math.round(((sm.delivered||0) / totalOrders) * 100) : 0,
-        refusalRate:   totalOrders > 0 ? Math.round(((sm.refused||0)   / totalOrders) * 100) : 0,
-      },
+      today:   { orders: todayOrders[0]?.orders||0, revenue: todayOrders[0]?.revenue||0 },
+      month:   { orders: monthOrders[0]?.orders||0, revenue: monthOrders[0]?.revenue||0 },
+      allTime: { orders: allTotal, delivered: allDelivered, refused: allRefused, deliveryRate, refusalRate },
     },
     topProducts,
     topCities,
-    affiliates: affiliateStats[0] || { total: 0, clicks: 0, orders: 0, commissions: 0 },
     revenueByDay,
+    affiliates: affStats[0] || { total:0, clicks:0, orders:0, commissions:0 },
   });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/analytics/client-scores  — Client scoring report
-   ──────────────────────────────────────────────────────────── */
-router.get('/client-scores', asyncHandler(async (req, res) => {
-  const scores = await User.aggregate([
-    { $match: { role: 'client' } },
-    { $group: {
-      _id:   null,
-      avg:   { $avg: '$clientScore.total' },
-      high:  { $sum: { $cond: [{ $gte: ['$clientScore.total', 70] }, 1, 0] } },
-      med:   { $sum: { $cond: [{ $and: [{ $gte: ['$clientScore.total', 40] }, { $lt: ['$clientScore.total', 70] }] }, 1, 0] } },
-      low:   { $sum: { $cond: [{ $lt: ['$clientScore.total', 40] }, 1, 0] } },
-      total: { $sum: 1 },
-    }},
+/* GET /api/analytics/client-scores */
+router.get('/client-scores', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const [high, med, low] = await Promise.all([
+    User.countDocuments({ role:'client', 'clientScore.total':{ $gte:70 } }),
+    User.countDocuments({ role:'client', 'clientScore.total':{ $gte:40, $lt:70 } }),
+    User.countDocuments({ role:'client', 'clientScore.total':{ $lt:40 } }),
   ]);
-
-  const topClients = await User.find({ role: 'client' })
-    .sort('-clientScore.total')
-    .limit(20)
-    .select('name phone city clientScore loyaltyPoints');
-
-  res.json({ status: 'success', scores: scores[0], topClients });
+  res.json({ status:'success', scores:{ high, med, low } });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/analytics/products  — Product performance
-   ──────────────────────────────────────────────────────────── */
-router.get('/products', asyncHandler(async (req, res) => {
-  const [performance, lowStock, views] = await Promise.all([
-    Product.find({ isActive: true })
-      .sort('-sold')
-      .limit(20)
-      .select('name cat price sold stock views'),
-    Product.find({ isActive: true, stock: { $lte: 10, $gt: 0 } })
-      .sort('stock')
-      .select('name stock price'),
-    Product.find({ isActive: true })
-      .sort('-views')
-      .limit(10)
-      .select('name views sold'),
-  ]);
-
-  res.json({ status: 'success', performance, lowStock, mostViewed: views });
+/* GET /api/analytics/products */
+router.get('/products', protect, restrictTo('admin','superadmin'), asyncHandler(async (req, res) => {
+  const products = await Product.find({ isActive:true }).sort('-sold').limit(20).select('name img cat price sold views rating stock').lean();
+  res.json({ status:'success', products });
 }));
 
 module.exports = router;

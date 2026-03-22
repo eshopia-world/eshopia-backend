@@ -1,379 +1,264 @@
 'use strict';
 const express   = require('express');
+const rateLimit = require('express-rate-limit');
 const Order     = require('../models/Order');
 const Product   = require('../models/Product');
 const User      = require('../models/User');
 const Affiliate = require('../models/Affiliate');
-const { AppError, asyncHandler } = require('../middleware/errorHandler');
-const { protect, restrictTo, optionalAuth } = require('../middleware/auth');
-const { orderLimiter } = require('../middleware/rateLimiter');
-const fraudService    = require('../services/fraudService');
-const notifyService   = require('../services/notifyService');
+const { asyncHandler, protect, restrictTo, optionalAuth } = require('../middleware/auth');
+const router    = express.Router();
 
-const router = express.Router();
+const orderLimiter = rateLimit({ windowMs: 60*60*1000, max: 3, message: { status:'fail', message:'Max 3 orders per hour.' }});
 
-/* ────────────────────────────────────────────────────────────
-   POST /api/orders  — Place a new order (COD)
-   No auth required (COD = cash on delivery)
-   ──────────────────────────────────────────────────────────── */
-router.post('/', orderLimiter, optionalAuth, asyncHandler(async (req, res, next) => {
+/* ── Fraud scoring ─────────────────────────────── */
+async function scoreOrder(req, phone) {
+  let score = 0;
+  const flags = [];
+  // Phone history
+  const phoneOrders = await Order.find({ 'client.phone': phone }).select('status').lean();
+  const refused = phoneOrders.filter(o => o.status === 'refused').length;
+  if (phoneOrders.length > 0) {
+    const rate = refused / phoneOrders.length;
+    if (rate > 0.7)      { score += 40; flags.push('HIGH_REFUSAL_RATE'); }
+    else if (rate > 0.5) { score += 20; flags.push('MEDIUM_REFUSAL_RATE'); }
+  }
+  // Today orders same phone
+  const today = new Date(); today.setHours(0,0,0,0);
+  const todayCount = await Order.countDocuments({ 'client.phone': phone, createdAt: { $gte: today } });
+  if (todayCount >= 3) { score += 30; flags.push('MULTIPLE_ORDERS_SAME_DAY'); }
+  // IP velocity
+  if (req.ip) {
+    const hourAgo = new Date(Date.now() - 3600000);
+    const ipCount = await Order.countDocuments({ clientIp: req.ip, createdAt: { $gte: hourAgo } });
+    if (ipCount >= 5) { score += 35; flags.push('IP_VELOCITY_HIGH'); }
+  }
+  return { score: Math.min(100, score), flags };
+}
+
+/* POST /api/orders — Place order */
+router.post('/', orderLimiter, optionalAuth, asyncHandler(async (req, res) => {
   const { client, items, affiliateCode, idempotencyKey, lang, source } = req.body;
+  if (!client?.name || !client?.phone || !client?.city || !client?.address)
+    return res.status(400).json({ status:'fail', message:'Client info required.' });
+  if (!items?.length)
+    return res.status(400).json({ status:'fail', message:'Order must have items.' });
+  if (!client.phone.match(/^0[5-7]\d{8}$/))
+    return res.status(400).json({ status:'fail', message:'Invalid Moroccan phone number.' });
 
-  // ── 1. Basic validation ──────────────────────────────────
-  if (!client?.name || !client?.phone || !client?.city || !client?.address) {
-    return next(new AppError('Name, phone, city and address are required.', 400));
-  }
-  if (!Array.isArray(items) || items.length === 0) {
-    return next(new AppError('Order must contain at least one item.', 400));
-  }
-  if (!client.phone.match(/^0[5-7]\d{8}$/)) {
-    return next(new AppError('Invalid phone number format.', 400));
-  }
-
-  // ── 2. Idempotency check (prevent double submission) ─────
+  // Idempotency
   if (idempotencyKey) {
     const existing = await Order.findOne({ idempotencyKey });
-    if (existing) {
-      return res.json({ status: 'success', order: existing, duplicate: true });
-    }
+    if (existing) return res.json({ status:'success', order: existing, duplicate: true });
   }
 
-  // ── 3. Validate products & compute totals ────────────────
-  let subtotal = 0;
+  // Fraud check
+  const { score, flags } = await scoreOrder(req, client.phone);
+  if (score >= 80) return res.status(422).json({ status:'fail', message:'Order blocked for security reasons.' });
+
+  // Build items & decrement stock
   const orderItems = [];
-
+  let subtotal = 0;
   for (const item of items) {
-    const product = await Product.findById(item.productId);
-    if (!product || !product.isActive) {
-      return next(new AppError(`Product ${item.productId} not found or unavailable.`, 400));
-    }
-    if (product.stock < item.qty) {
-      return next(new AppError(`Insufficient stock for "${product.name}". Available: ${product.stock}`, 400));
-    }
-
-    const price = product.effectivePrice;
-    subtotal += price * item.qty;
-    orderItems.push({
-      productId:   product._id,
-      productName: product.name,
-      productImg:  product.img,
-      qty:         item.qty,
-      price,
-      vendorId:    product.vendorId,
-    });
+    const product = await Product.findOneAndUpdate(
+      { _id: item.productId, stock: { $gte: item.qty || 1 }, isActive: true },
+      { $inc: { stock: -(item.qty || 1), sold: (item.qty || 1) } },
+      { new: true } // NOT lean - we need virtuals (effectivePrice)
+    );
+    if (!product) return res.status(400).json({ status:'fail', message:`Product ${item.productId} unavailable.` });
+    // effectivePrice is a virtual - works on full mongoose document
+    const itemPrice = (product.flashDeal?.isActive && product.flashDeal?.flashPrice && new Date() < product.flashDeal.endTime)
+      ? product.flashDeal.flashPrice
+      : product.price;
+    orderItems.push({ productId: product._id, productName: product.name, qty: item.qty||1, price: itemPrice });
+    subtotal += product.price * (item.qty || 1);
   }
 
-  // ── 4. Delivery fee calculation ──────────────────────────
-  const FREE_THRESHOLD = parseFloat(process.env.FREE_DELIVERY_THRESHOLD) || 129;
-  const deliveryFee = subtotal >= FREE_THRESHOLD ? 0 : getDeliveryFee(client.city);
-  const total = subtotal + deliveryFee;
+  // Delivery fee
+  const FREE_FROM = parseFloat(process.env.FREE_DELIVERY_THRESHOLD) || 129;
+  const EXPRESS_CITIES = ['Casablanca','Rabat','Marrakech'];
+  const deliveryFee = subtotal >= FREE_FROM ? 0 : EXPRESS_CITIES.includes(client.city) ? 0 : 30;
 
-  // ── 5. Anti-fraud scoring ────────────────────────────────
-  const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
-  const { fraudScore, fraudFlags, isBlocked } = await fraudService.scoreOrder({
-    phone: client.phone,
-    ip: clientIp,
-    total,
-    affiliateCode,
-  });
-
-  if (isBlocked) {
-    return next(new AppError('Order blocked due to suspicious activity. Contact support.', 403));
-  }
-
-  // ── 6. Affiliate validation ──────────────────────────────
+  // Affiliate
   let affiliateId = null;
   let commission  = 0;
-  let commissionStatus = 'none';
-
   if (affiliateCode) {
-    const aff = await Affiliate.findOne({ code: affiliateCode.toUpperCase(), isActive: true });
+    const aff = await Affiliate.findOne({ code: affiliateCode.toUpperCase(), isActive: true, autoSuspended: false });
     if (aff) {
-      // Prevent self-referral
-      const isSelfRef = req.user && req.user._id.toString() === aff.userId.toString();
-      const isSamePhone = aff.userPhone === client.phone;
-
-      if (!isSelfRef && !isSamePhone) {
+      // Self-referral check
+      const isSelf = req.user && (String(req.user._id) === String(aff.userId));
+      // userPhone not stored in affiliate - check via User model
+      let isSamePhone = false;
+      if (aff.userId) {
+        const affUser = await User.findById(aff.userId).select('phone').lean();
+        isSamePhone = affUser?.phone && affUser.phone === client.phone;
+      }
+      if (!isSelf && !isSamePhone) {
         affiliateId = aff._id;
-        commission  = Math.round(total * aff.commissionRate);
-        commissionStatus = 'pending'; // credited only after delivery
+        commission  = Math.round(subtotal * (aff.commissionRate || 0.10));
+        await Affiliate.findByIdAndUpdate(aff._id, { $inc: { totalOrders: 1, pendingBalance: commission } });
       }
     }
   }
 
-  // ── 7. Create order ──────────────────────────────────────
+  // Create order
   const order = await Order.create({
-    client:     { ...client, userId: req.user?._id },
-    items:      orderItems,
+    client: { ...client, userId: req.user?._id },
+    items:  orderItems,
     subtotal,
     deliveryFee,
-    total,
-    affiliateCode,
+    total: subtotal + deliveryFee,
+    affiliateCode: affiliateCode?.toUpperCase(),
     affiliateId,
     affiliateCommission: commission,
-    commissionStatus,
-    clientIp,
-    userAgent:    req.headers['user-agent'],
-    fraudScore,
-    fraudFlags,
+    commissionStatus: commission > 0 ? 'pending' : 'none',
+    fraudScore: score,
+    fraudFlags: flags,
     idempotencyKey,
-    lang:   lang || 'fr',
+    clientIp: req.headers['x-forwarded-for']?.split(',')[0] || req.ip,
     source: source || 'web',
-    lifecycle: [{ status: 'pending', note: 'Order placed via web', timestamp: new Date() }],
+    lang: lang || 'fr',
   });
 
-  // ── 8. Decrement stock atomically ────────────────────────
-  for (const item of orderItems) {
-    await Product.findByIdAndUpdate(item.productId, {
-      $inc: { stock: -item.qty },
-    });
-  }
+  order.lifecycle.push({ status: 'pending', note: 'Order placed' });
+  await order.save();
 
-  // ── 9. Update affiliate click stats ──────────────────────
-  if (affiliateId) {
-    await Affiliate.findByIdAndUpdate(affiliateId, {
-      $inc: { totalOrders: 1, pendingBalance: commission },
-    });
-  }
-
-  // ── 10. Update client score (if registered) ───────────────
-  if (req.user) {
-    await User.findByIdAndUpdate(req.user._id, {
-      $inc: { 'clientScore.ordersPlaced': 1 },
-    });
-  }
-
-  // ── 11. Send notifications (async, don't block response) ──
-  notifyService.orderPlaced(order).catch(() => {});
+  // Notify (async, don't block response)
+  try {
+    const notify = require('../services/notifyService');
+    notify.orderPlaced(order).catch(() => {});
+  } catch {}
 
   res.status(201).json({
     status: 'success',
-    message: 'Order placed successfully.',
     order: {
       orderNumber: order.orderNumber,
       total:       order.total,
+      deliveryFee: order.deliveryFee,
       status:      order.status,
-      estimatedDelivery: getEstimatedDelivery(client.city),
+      createdAt:   order.createdAt,
     },
   });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/orders/track/:orderNumber  — Public tracking
-   ──────────────────────────────────────────────────────────── */
-router.get('/track/:orderNumber', asyncHandler(async (req, res, next) => {
-  const order = await Order.findOne({ orderNumber: req.params.orderNumber })
-    .select('orderNumber status lifecycle client.name client.city total items deliveredAt shippedAt confirmedAt');
-
-  if (!order) return next(new AppError('Order not found. Check your order number.', 404));
-
-  res.json({ status: 'success', order });
+/* GET /api/orders/track/:num — Public tracking */
+router.get('/track/:num', asyncHandler(async (req, res) => {
+  const order = await Order.findOne({ orderNumber: req.params.num.toUpperCase() })
+    .select('orderNumber status lifecycle client.name client.city total deliveryFee trackingCode confirmedAt shippedAt deliveredAt createdAt items')
+    .lean();
+  if (!order) return res.status(404).json({ status:'fail', message:'Order not found.' });
+  res.json({
+    status: 'success',
+    tracking: {
+      orderNumber: order.orderNumber,
+      status:      order.status,
+      city:        order.client?.city,
+      total:       order.total,
+      itemCount:   order.items?.length,
+      trackingCode:order.trackingCode,
+      timeline:    order.lifecycle,
+      confirmedAt: order.confirmedAt,
+      shippedAt:   order.shippedAt,
+      deliveredAt: order.deliveredAt,
+      createdAt:   order.createdAt,
+    },
+  });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/orders  — Admin: list all orders (paginated)
-   ──────────────────────────────────────────────────────────── */
-router.get('/', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res) => {
-  const { status, city, search, page = 1, limit = 25, sort = '-createdAt' } = req.query;
-
+/* GET /api/orders — Admin list */
+router.get('/', protect, restrictTo('admin','superadmin','agent'), asyncHandler(async (req, res) => {
+  const { status, city, search, limit=25, page=1 } = req.query;
   const filter = {};
   if (status) filter.status = status;
   if (city)   filter['client.city'] = new RegExp(city, 'i');
-  if (search) {
-    filter.$or = [
-      { orderNumber: new RegExp(search, 'i') },
-      { 'client.name': new RegExp(search, 'i') },
-      { 'client.phone': new RegExp(search, 'i') },
-    ];
-  }
-
-  const [orders, total] = await Promise.all([
-    Order.find(filter)
-      .sort(sort)
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit))
-      .select('-lifecycle -fraudFlags -userAgent'),
-    Order.countDocuments(filter),
-  ]);
-
-  res.json({
-    status: 'success',
-    total,
-    pages: Math.ceil(total / parseInt(limit)),
-    page: parseInt(page),
-    orders,
-  });
+  if (search) filter.$or = [
+    { orderNumber: new RegExp(search, 'i') },
+    { 'client.name': new RegExp(search, 'i') },
+    { 'client.phone': new RegExp(search, 'i') },
+  ];
+  const orders = await Order.find(filter).sort('-createdAt').limit(+limit).skip((+page-1)*+limit).lean();
+  const total  = await Order.countDocuments(filter);
+  res.json({ status:'success', total, orders });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/orders/stats/summary  — Admin KPIs
-   ──────────────────────────────────────────────────────────── */
-router.get('/stats/summary', protect, restrictTo('admin', 'superadmin'), asyncHandler(async (req, res) => {
-  const [stats, revenue] = await Promise.all([
-    Order.aggregate([
-      { $group: { _id: '$status', count: { $sum: 1 } } },
-    ]),
-    Order.aggregate([
-      { $match: { status: { $in: ['delivered', 'confirmed', 'shipped'] } } },
-      { $group: { _id: null, total: { $sum: '$total' }, count: { $sum: 1 } } },
-    ]),
+/* GET /api/orders/stats/summary */
+router.get('/stats/summary', protect, restrictTo('admin','superadmin','agent'), asyncHandler(async (req, res) => {
+  const [total, pending, confirmed, delivered, refused] = await Promise.all([
+    Order.countDocuments(),
+    Order.countDocuments({ status:'pending' }),
+    Order.countDocuments({ status:'confirmed' }),
+    Order.countDocuments({ status:'delivered' }),
+    Order.countDocuments({ status:'refused' }),
   ]);
-
-  const statusMap = Object.fromEntries(stats.map(s => [s._id, s.count]));
-
-  res.json({
-    status: 'success',
-    stats: {
-      total:     Object.values(statusMap).reduce((a, b) => a + b, 0),
-      pending:   statusMap.pending || 0,
-      confirmed: statusMap.confirmed || 0,
-      shipped:   statusMap.shipped || 0,
-      delivered: statusMap.delivered || 0,
-      refused:   statusMap.refused || 0,
-      cancelled: statusMap.cancelled || 0,
-      revenue:   revenue[0]?.total || 0,
-      avgOrder:  revenue[0] ? Math.round(revenue[0].total / revenue[0].count) : 0,
-    },
-  });
+  const revenueAgg = await Order.aggregate([
+    { $match: { status: { $in: ['delivered'] } } },
+    { $group: { _id: null, revenue: { $sum: '$total' } } },
+  ]);
+  res.json({ status:'success', total, pending, confirmed, delivered, refused, revenue: revenueAgg[0]?.revenue || 0 });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   GET /api/orders/queue  — Agent: next orders to call
-   ──────────────────────────────────────────────────────────── */
-router.get('/queue', protect, restrictTo('admin', 'agent', 'superadmin'), asyncHandler(async (req, res) => {
-  const queue = await Order.find({ status: 'pending' })
-    .sort('createdAt')
-    .limit(20)
-    .select('orderNumber client.name client.phone client.city total items createdAt fraudScore');
-
-  const [stats] = await Order.aggregate([
-    { $group: {
-      _id: null,
-      total:     { $sum: 1 },
-      pending:   { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
-      confirmed: { $sum: { $cond: [{ $eq: ['$status', 'confirmed'] }, 1, 0] } },
-    }},
-  ]);
-
-  res.json({ status: 'success', queue, stats: stats || { total: 0, pending: 0, confirmed: 0 } });
+/* GET /api/orders/queue */
+router.get('/queue', protect, restrictTo('admin','superadmin','agent'), asyncHandler(async (req, res) => {
+  const orders = await Order.find({ status:'pending', isBlocked:false }).sort('createdAt').limit(50).lean();
+  res.json({ status:'success', orders });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   POST /api/orders/queue/assign-next  — Agent: grab next order
-   ──────────────────────────────────────────────────────────── */
-router.post('/queue/assign-next', protect, restrictTo('admin', 'agent', 'superadmin'), asyncHandler(async (req, res, next) => {
+/* POST /api/orders/queue/assign-next */
+router.post('/queue/assign-next', protect, restrictTo('admin','superadmin','agent'), asyncHandler(async (req, res) => {
   const order = await Order.findOneAndUpdate(
-    { status: 'pending', assignedAgent: null },
-    {
-      assignedAgent:     req.user._id,
-      assignedAgentName: req.user.name,
-      $push: { lifecycle: { status: 'pending', note: `Assigned to agent: ${req.user.name}`, agentId: req.user._id } },
-    },
-    { sort: 'createdAt', new: true }
+    { status:'pending', isBlocked:false, assignedAgent:null },
+    { $set: { assignedAgent:req.user._id, assignedAgentName:req.user.name } },
+    { new:true, sort:{ createdAt:1 } }
   );
-
-  if (!order) return next(new AppError('No orders in queue.', 404));
-  res.json({ status: 'success', order });
+  if (!order) return res.status(404).json({ status:'fail', message:'Queue empty.' });
+  res.json({ status:'success', order });
 }));
 
-/* ────────────────────────────────────────────────────────────
-   PUT /api/orders/:id/confirm  — Agent/Admin: update order status
-   ──────────────────────────────────────────────────────────── */
-router.put('/:id/confirm', protect, restrictTo('admin', 'agent', 'superadmin'), asyncHandler(async (req, res, next) => {
+/* PUT /api/orders/:id/confirm — Update status */
+router.put('/:id/confirm', protect, restrictTo('admin','superadmin','agent'), asyncHandler(async (req, res) => {
   const { status, note, trackingCode } = req.body;
-
-  const VALID = ['confirmed', 'shipped', 'delivered', 'refused', 'cancelled'];
-  if (!VALID.includes(status)) {
-    return next(new AppError(`Invalid status. Must be one of: ${VALID.join(', ')}`, 400));
-  }
+  const allowed = ['confirmed','shipped','delivered','refused','cancelled'];
+  if (!allowed.includes(status)) return res.status(400).json({ status:'fail', message:'Invalid status.' });
 
   const order = await Order.findById(req.params.id);
-  if (!order) return next(new AppError('Order not found.', 404));
+  if (!order) return res.status(404).json({ status:'fail', message:'Order not found.' });
 
-  order.addLifecycleEvent(status, note || `Status updated to ${status}`, req.user._id, req.user.name);
+  order.addLifecycleEvent(status, note || '', req.user._id, req.user.name);
   if (trackingCode) order.trackingCode = trackingCode;
 
-  // ── Handle delivered: credit affiliate commission ─────────
-  if (status === 'delivered') {
-    if (order.affiliateId && order.commissionStatus === 'pending') {
-      await Affiliate.findByIdAndUpdate(order.affiliateId, {
-        $inc: {
-          deliveredOrders: 1,
-          availableBalance: order.affiliateCommission,
-          pendingBalance:  -order.affiliateCommission,
-          totalEarned:      order.affiliateCommission,
-        },
-      });
-      order.commissionStatus = 'credited';
-    }
-    // Update product sold count
+  // Handle affiliate commission
+  if (status === 'delivered' && order.affiliateId && order.commissionStatus === 'pending') {
+    order.commissionStatus = 'credited';
+    await Affiliate.findByIdAndUpdate(order.affiliateId, {
+      $inc: { deliveredOrders:1, totalEarned:order.affiliateCommission, availableBalance:order.affiliateCommission, pendingBalance:-order.affiliateCommission },
+    });
+  }
+  if (['refused','cancelled'].includes(status) && order.affiliateId && order.commissionStatus === 'pending') {
+    order.commissionStatus = 'cancelled';
+    await Affiliate.findByIdAndUpdate(order.affiliateId, {
+      $inc: { cancelledOrders:1, pendingBalance:-order.affiliateCommission },
+    });
+    // Restore stock
     for (const item of order.items) {
-      await Product.findByIdAndUpdate(item.productId, { $inc: { sold: item.qty } });
-    }
-    // Update client score
-    if (order.client.userId) {
-      const user = await User.findById(order.client.userId);
-      if (user) {
-        user.clientScore.ordersDelivered += 1;
-        user.clientScore.totalSpent += order.total;
-        user.loyaltyPoints += Math.floor(order.total / 10);
-        user.recomputeScore();
-        await user.save({ validateBeforeSave: false });
-      }
+      await Product.findByIdAndUpdate(item.productId, { $inc: { stock:item.qty, sold:-item.qty } });
     }
   }
 
-  // ── Handle refused: cancel affiliate commission ───────────
-  if (status === 'refused' || status === 'cancelled') {
-    if (order.affiliateId && order.commissionStatus === 'pending') {
-      await Affiliate.findByIdAndUpdate(order.affiliateId, {
-        $inc: {
-          cancelledOrders: 1,
-          pendingBalance: -order.affiliateCommission,
-        },
-      });
-      order.commissionStatus = 'cancelled';
-    }
-    // Restore stock
-    for (const item of order.items) {
-      await Product.findByIdAndUpdate(item.productId, { $inc: { stock: item.qty } });
-    }
-    // Update client score
-    if (order.client.userId && status === 'refused') {
-      const user = await User.findById(order.client.userId);
-      if (user) {
-        user.clientScore.ordersRefused += 1;
-        user.recomputeScore();
-        await user.save({ validateBeforeSave: false });
-      }
-    }
+  // Agent stats
+  if (['confirmed','refused'].includes(status)) {
+    await User.findByIdAndUpdate(req.user._id, {
+      $inc: {
+        'agentStats.totalCalls': 1,
+        [`agentStats.${status === 'confirmed' ? 'confirmed' : 'refused'}`]: 1,
+      },
+    });
   }
 
   await order.save();
 
-  // Send status notification
-  notifyService.orderStatusUpdated(order).catch(() => {});
+  // Notify customer
+  try { require('../services/notifyService').orderStatusUpdated(order).catch(()=>{}); } catch {}
 
-  res.json({ status: 'success', order });
+  res.json({ status:'success', order });
 }));
-
-/* ────────────────────────────────────────────────────────────
-   Helpers
-   ──────────────────────────────────────────────────────────── */
-function getDeliveryFee(city) {
-  const express24h  = ['Casablanca', 'Rabat', 'Marrakech'];
-  const standard48h = ['Fès', 'Fes', 'Tanger', 'Agadir', 'Meknès', 'Oujda', 'Kénitra', 'Tétouan'];
-  if (express24h.includes(city))  return 0;   // free delivery everywhere (just varies speed)
-  if (standard48h.includes(city)) return 0;
-  return 0; // COD free delivery across Morocco (adjust as needed)
-}
-
-function getEstimatedDelivery(city) {
-  const express24h = ['Casablanca', 'Rabat', 'Marrakech'];
-  const days = express24h.includes(city) ? 1 : 2;
-  const date = new Date();
-  date.setDate(date.getDate() + days);
-  return date.toLocaleDateString('fr-MA', { weekday: 'long', day: 'numeric', month: 'long' });
-}
 
 module.exports = router;
