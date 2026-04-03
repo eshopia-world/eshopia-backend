@@ -61,6 +61,27 @@ app.use('/api/tracking',    require('./routes/tracking'));
 app.use('/api/analytics',   require('./routes/analytics'));
 app.use('/api/delivery',    require('./routes/delivery'));
 
+/* ── Seed route (one-time use) ────────────────── */
+app.get('/api/seed-now', async (req, res) => {
+  const secret = req.query.secret;
+  if (secret !== 'eshopia2026') {
+    return res.status(403).json({ message: 'Forbidden' });
+  }
+  try {
+    const { exec } = require('child_process');
+    const path = require('path');
+    const seedPath = path.join(__dirname, '../scripts/seed.js');
+    exec(`node ${seedPath}`, { timeout: 30000 }, (err, stdout, stderr) => {
+      if (err) {
+        return res.status(500).json({ status: 'error', message: err.message, stderr });
+      }
+      res.json({ status: 'ok', message: '✅ Seed terminé !', output: stdout });
+    });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
 /* ── 404 ──────────────────────────────────────── */
 app.use((req, res) => res.status(404).json({ status: 'fail', message: 'Route not found' }));
 
