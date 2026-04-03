@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: eshopia-backend
+    env: node
+    buildCommand: npm install
+    startCommand: node src/server.js
+    plan: free
